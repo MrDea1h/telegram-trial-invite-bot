@@ -1,0 +1,14 @@
+# One container: long polling (no domain, no inbound port) and SQLite on a named volume.
+name: invite-bot
+
+services:
+  bot:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    mem_limit: 96m
+    volumes:
+      - data:/data
+
+volumes:
+  data: {}
