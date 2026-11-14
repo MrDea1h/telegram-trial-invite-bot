@@ -80,3 +80,7 @@ bot/
 ```
 
 Request statuses: `pending` → `approved` → `active` → `expired`, plus `rejected`, `left` (left early), `revoked` (removed by an admin) and `reset` (an admin allowed a new request).
+
+## License
+
+[MIT](LICENSE)
