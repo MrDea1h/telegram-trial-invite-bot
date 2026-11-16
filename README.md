@@ -21,7 +21,8 @@ Sent to the bot in a private chat, by users listed in `ADMIN_IDS`.
 | Command | What it does |
 |---|---|
 | `/pending` | requests waiting for a decision, each with its buttons |
-| `/list` | who is in the chat on a trial and until when |
+| `/list` | who is in the chat on a trial and until when; under it, a button that reminds everyone who was approved but has not joined |
+| `/remind` | the same reminder as a command: sends the join link again (a fresh one if the old link has run out) to every approved person who has not joined; at most once in 10 minutes |
 | `/extend <id> <days>` | extend someone's access |
 | `/revoke <id>` | remove from the chat early, or cancel an approval |
 | `/reset <id>` | allow a new request (lifts the ban in the chat) |

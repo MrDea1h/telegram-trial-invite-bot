@@ -381,6 +381,59 @@ def test_admin_link_needs_a_bound_chat():
     assert "не привязан" in api.sent(ADMIN)[-1] and "createChatInviteLink" not in api.methods()
 
 
+def test_rate_limited_links_are_queued_and_sent_later(env):
+    service, api, clock = env
+    for user in (EVA, BOB):
+        service.handle(private("/start", user))
+    limit = TgError("createChatInviteLink", 429, "Too Many Requests: retry after 20", 20)
+    api.fail["createChatInviteLink"] = limit
+
+    service.handle(press("ok", EVA["id"]))
+    assert "чуть позже" in api.sent(EVA["id"])[-1]
+    assert "ограничил частоту" in api.last("editMessageText")["text"]
+    # While Telegram asks to wait, the bot does not even try.
+    attempts = api.methods().count("createChatInviteLink")
+    service.handle(press("ok", BOB["id"]))
+    service.tick()
+    assert api.methods().count("createChatInviteLink") == attempts
+    assert "чуть позже" in api.sent(BOB["id"])[-1]
+
+    # Still limited after the pause: nobody is told anything twice.
+    clock.t += 22
+    service.tick()
+    assert sum("чуть позже" in text for text in api.sent(EVA["id"])) == 1
+
+    del api.fail["createChatInviteLink"]
+    clock.t += 22
+    service.tick()
+    service.tick()
+    for user in (EVA, BOB):
+        assert sum("Ссылка в чат" in text for text in api.sent(user["id"])) == 1
+        assert service.store.get(user["id"])["invite_link"]
+    service.handle(join_request(EVA))
+    assert service.store.get(EVA["id"])["status"] == "active"
+
+
+def test_queued_link_that_cannot_be_delivered_is_reported(env):
+    service, api, clock = env
+    service.handle(private("/start", EVA))
+    api.fail["createChatInviteLink"] = TgError("createChatInviteLink", 429, "retry after 5", 5)
+    service.handle(press("ok", EVA["id"]))
+    del api.fail["createChatInviteLink"]
+    real_call = api.call
+
+    def call(method, _timeout=None, **params):
+        if method == "sendMessage" and params["chat_id"] == EVA["id"]:
+            raise TgError(method, 403, "bot was blocked by the user")
+        return real_call(method, _timeout, **params)
+
+    api.call = call
+    clock.t += 10
+    service.tick()
+    service.tick()
+    assert sum("Не смог написать" in text for text in api.sent(ADMIN)) == 1
+
+
 def test_bind_requires_rights_and_an_admin():
     api, clock = FakeApi(), Clock()
     cfg = Config(token=f"{BOT_ID}:secret", admin_ids=frozenset({ADMIN}))
@@ -402,6 +455,126 @@ def test_bind_requires_rights_and_an_admin():
 
     service.handle(group_msg("/bind", ADMIN))
     assert service.chat_id == CHAT
+
+
+def press_remind(admin_id=ADMIN):
+    return {
+        "callback_query": {
+            "id": "q2",
+            "from": {"id": admin_id},
+            "data": "remind_all",
+            "message": {"message_id": 12, "chat": {"id": admin_id}},
+        }
+    }
+
+
+def test_remind_button_writes_only_to_approved_people_who_have_not_joined(env):
+    service, api, clock = env
+    carl = {"id": 7, "first_name": "Карл"}
+    admit(service, BOB)  # inside the chat
+    service.handle(private("/start", EVA))
+    service.handle(press("ok", EVA["id"]))  # approved, has a link, did not join
+    service.handle(private("/start", carl))  # still waiting for a decision
+    api.calls.clear()
+
+    service.handle(private("/list", ADMIN))
+    button = api.last("sendMessage")["reply_markup"]["inline_keyboard"][0][0]
+    assert button == {"text": "Напомнить не вошедшим (1)", "callback_data": "remind_all"}
+
+    clock.t += HOUR
+    service.handle(press_remind())
+    assert "Напоминаем" in api.sent(EVA["id"])[-1]
+    # The link is the one she already has, with its real end time, not "a day".
+    assert "https://t.me/+link2" in api.sent(EVA["id"])[-1] and api.links == 2
+    assert "действует сутки" not in api.sent(EVA["id"])[-1]
+    assert not any("Напоминаем" in text for text in api.sent(BOB["id"]) + api.sent(carl["id"]))
+    assert api.sent(ADMIN)[-1] == "Напоминание отправлено: 1 из 1."
+    assert api.last("editMessageReplyMarkup")["reply_markup"] == {"inline_keyboard": []}
+
+    # The same link still lets her in.
+    service.handle(join_request(EVA))
+    assert service.store.get(EVA["id"])["status"] == "active"
+
+
+def test_remind_has_a_cooldown_shared_by_admins(env):
+    service, api, clock = env
+    service.handle(private("/start", EVA))
+    service.handle(press("ok", EVA["id"]))
+    service.handle(private("/remind", ADMIN))
+    assert sum("Напоминаем" in text for text in api.sent(EVA["id"])) == 1
+
+    clock.t += 60
+    service.handle(press_remind(ADMIN2))
+    assert sum("Напоминаем" in text for text in api.sent(EVA["id"])) == 1
+    assert "уже рассылали" in api.sent(ADMIN2)[-1] and "через 9 мин" in api.sent(ADMIN2)[-1]
+
+    clock.t += 600
+    service.handle(press_remind(ADMIN2))
+    assert sum("Напоминаем" in text for text in api.sent(EVA["id"])) == 2
+
+
+def test_remind_reissues_expired_links_and_queues_them_under_a_rate_limit(env):
+    service, api, clock = env
+    for user in (EVA, BOB):
+        service.handle(private("/start", user))
+        service.handle(press("ok", user["id"]))
+    clock.t += 2 * DAY  # both links have run out
+
+    service.handle(private("/remind", ADMIN))
+    assert "https://t.me/+link3" in api.sent(EVA["id"])[-1]
+    assert "https://t.me/+link4" in api.sent(BOB["id"])[-1]
+    assert api.sent(ADMIN)[-1] == "Напоминание отправлено: 2 из 2."
+
+    clock.t += 2 * DAY
+    api.fail["createChatInviteLink"] = TgError("createChatInviteLink", 429, "retry after 20", 20)
+    service.handle(private("/remind", ADMIN))
+    assert "Напоминание отправлено: 0 из 2." in api.sent(ADMIN)[-1]
+    assert "Ещё 2 получат ссылку чуть позже" in api.sent(ADMIN)[-1]
+    # One attempt, then the limit is respected; the people are not told to wait again.
+    assert api.methods().count("createChatInviteLink") == 5
+    assert not any("чуть позже" in text for text in api.sent(EVA["id"]))
+
+    del api.fail["createChatInviteLink"]
+    clock.t += 22
+    service.tick()
+    for user in (EVA, BOB):
+        assert service.store.get(user["id"])["invite_link"]
+        assert "Ссылка в чат" in api.sent(user["id"])[-1]
+
+
+def test_remind_reports_people_it_could_not_write_to(env):
+    service, api, _ = env
+    for user in (EVA, BOB):
+        service.handle(private("/start", user))
+        service.handle(press("ok", user["id"]))
+    real_call = api.call
+
+    def call(method, _timeout=None, **params):
+        if method == "sendMessage" and params["chat_id"] == EVA["id"]:
+            raise TgError(method, 403, "bot was blocked by the user")
+        return real_call(method, _timeout, **params)
+
+    api.call = call
+    service.handle(private("/remind", ADMIN))
+    report = api.sent(ADMIN)[-1]
+    assert report.startswith("Напоминание отправлено: 1 из 2.")
+    assert "Не смог написать: 1" in report and "Ева Орлова" in report and "Боб" not in report
+
+
+def test_remind_is_for_admins_and_needs_someone_to_remind(env):
+    service, api, _ = env
+    service.handle(private("/remind", ADMIN))
+    assert api.sent(ADMIN)[-1] == "Одобренных, но не вошедших в чат, сейчас нет."
+
+    service.handle(private("/start", EVA))
+    service.handle(press("ok", EVA["id"]))
+    api.calls.clear()
+    service.handle(press_remind(admin_id=BOB["id"]))
+    assert api.last("answerCallbackQuery")["text"] == "Недоступно"
+    assert api.sent(EVA["id"]) == []
+    # A person typing the command is not an admin either: it is ignored like any other.
+    service.handle(private("/remind", BOB))
+    assert api.sent(EVA["id"]) == []
 
 
 def test_names_are_escaped(env):

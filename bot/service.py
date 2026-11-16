@@ -18,10 +18,22 @@ MSK = timezone(timedelta(hours=3))  # Moscow has no DST
 
 ALLOWED_UPDATES = ["message", "callback_query", "chat_join_request", "chat_member"]
 
+LINK_RETRY_SEC = 30  # pause after a failed link creation when Telegram names no delay
+UNDELIVERED = "Не смог написать человеку: пусть отправит мне /start, пришлю ссылку."
+REMIND_COOLDOWN_SEC = 600  # two admins pressing in a row must not write to everyone twice
+REMIND_ALL = "remind_all"  # callback data of the button under /list
+LINK_NOTES = {
+    "sent": "",
+    "undelivered": "\n" + UNDELIVERED,
+    "queued": "\nСсылку пришлю человеку чуть позже: Telegram ограничил частоту создания ссылок.",
+}
+
 ADMIN_HELP = (
     "<b>Команды</b>\n"
     "/pending — заявки, которые ждут решения\n"
     "/list — кто сейчас в чате и до какого числа\n"
+    "/remind — ещё раз прислать ссылку всем, кого одобрили, но кто так и не вошёл "
+    "(та же кнопка есть под /list)\n"
     "/extend <code>id</code> <code>дней</code> — продлить доступ\n"
     "/revoke <code>id</code> — убрать из чата досрочно или отменить одобрение\n"
     "/reset <code>id</code> — разрешить человеку подать заявку заново\n"
@@ -55,6 +67,7 @@ class Service:
         self.store = store
         self.cfg = cfg
         self._clock = clock
+        self.links_after = 0  # no link creation before this moment (rate limit)
 
     def now(self) -> int:
         return int(self._clock())
@@ -117,6 +130,7 @@ class Service:
         handlers = {
             "/pending": self.cmd_pending,
             "/list": self.cmd_list,
+            "/remind": self.cmd_remind,
             "/extend": self.cmd_extend,
             "/revoke": self.cmd_revoke,
             "/reset": self.cmd_reset,
@@ -198,37 +212,72 @@ class Service:
                 },
             )
 
-    def send_link(self, row) -> bool:
-        """Send the join link, making a new one when there is none or it has run out."""
+    def send_link(self, row, retrying: bool = False, remind: bool = False) -> str:
+        """Send the join link, making a new one when there is none or it has run out.
+
+        Returns "sent", "undelivered" (the person cannot be written to) or "queued": Telegram
+        limits how often links are created, so `tick` makes the link later and sends it then.
+        `remind` words the message as a reminder to someone who already got a link once.
+        """
         user_id = row["tg_user_id"]
         now = self.now()
         link = row["invite_link"]
-        if not link or (row["link_expires_at"] or 0) <= now + 60:
+        expires = row["link_expires_at"] or 0
+        if not link or expires <= now + 60:
+            link = None
             expires = now + self.cfg.link_ttl_sec
-            try:
-                created = self.api.call(
-                    "createChatInviteLink", chat_id=self.chat_id, name=f"trial {user_id}"[:32],
-                    expire_date=expires, creates_join_request=True,
-                )  # fmt: skip
-            except TgError as exc:
-                log.error("createChatInviteLink failed: %s", exc)
-                self.send(user_id, "Не получилось создать ссылку. Попробуйте /start чуть позже.")
-                return False
-            link = created["invite_link"]
+            if now >= self.links_after:
+                try:
+                    created = self.api.call(
+                        "createChatInviteLink", chat_id=self.chat_id,
+                        name=f"trial {user_id}"[:32], expire_date=expires,
+                        creates_join_request=True,
+                    )  # fmt: skip
+                    link = created["invite_link"]
+                except TgError as exc:
+                    self.links_after = now + (exc.retry_after or LINK_RETRY_SEC) + 1
+                    log.warning("createChatInviteLink failed: %s", exc)
+            if link is None:
+                # Forget the stale link so that `tick` picks the row up.
+                self.store.move(user_id, "approved", invite_link=None, link_expires_at=None)
+                if not retrying:
+                    self.send(
+                        user_id,
+                        "Заявка одобрена. Ссылку в чат пришлю чуть позже — обычно в течение "
+                        "нескольких минут, ничего нажимать не нужно.",
+                    )
+                return "queued"
             self.store.move(user_id, "approved", invite_link=link, link_expires_at=expires)
-        return self.send(
+        intro = (
+            "Напоминаем: заявка одобрена, а вы ещё не вошли в чат. "
+            f"Ссылка (только для вас, действует до {when(expires)}):\n"
+            if remind
+            else "Заявка одобрена. Ссылка в чат (только для вас, действует сутки):\n"
+        )
+        delivered = self.send(
             user_id,
-            "Заявка одобрена. Ссылка в чат (только для вас, действует сутки):\n"
-            f"{link}\n\n"
+            f"{intro}{link}\n\n"
             "Нажмите её и подайте запрос на вступление — я подтвержу его сразу. "
             f"Доступ продлится {days_word(self.cfg.trial_sec // DAY)} с момента входа.",
         )
+        return "sent" if delivered else "undelivered"
 
     # --- an admin decides ---------------------------------------------------------------
 
     def on_callback(self, query: dict) -> None:
         admin_id = query["from"]["id"]
         action, _, raw_id = (query.get("data") or "").partition(":")
+        if action == REMIND_ALL and admin_id in self.cfg.admin_ids:
+            self.answer(query, "Рассылаю")
+            # The count on the button is stale after this press: take the button away.
+            message = query.get("message") or {}
+            if "message_id" in message:
+                self.safe(
+                    "editMessageReplyMarkup", chat_id=message["chat"]["id"],
+                    message_id=message["message_id"], reply_markup={"inline_keyboard": []},
+                )  # fmt: skip
+            self.cmd_remind(admin_id, [])
+            return
         if admin_id not in self.cfg.admin_ids or action not in ("ok", "no") or not raw_id.isdigit():
             self.answer(query, "Недоступно")
             return
@@ -249,8 +298,7 @@ class Service:
 
         note = ""
         if action == "ok":
-            if not self.send_link(row):
-                note = "\nНе смог написать человеку: пусть отправит мне /start, пришлю ссылку."
+            note = LINK_NOTES[self.send_link(row)]
         else:
             self.send(user_id, "К сожалению, заявку отклонили.")
         self.answer(query, "Одобрено" if action == "ok" else "Отклонено")
@@ -332,6 +380,11 @@ class Service:
         chat_id = self.chat_id
         if chat_id is None:
             return
+        for row in self.store.awaiting_link():
+            if now < self.links_after:
+                break
+            if self.send_link(row, retrying=True) == "undelivered":
+                self.tell_admins(f"{UNDELIVERED}\n{person(row)}")
         for row in self.store.to_remind(now, self.cfg.remind_sec):
             if self.store.move(row["tg_user_id"], "active", reminded_at=now):
                 self.send(
@@ -373,14 +426,15 @@ class Service:
             self.send(admin_id, "Такого человека в заявках нет.")
         return row
 
-    def send_long(self, chat_id: int, title: str, lines: list[str]) -> None:
+    def send_long(self, chat_id: int, title: str, lines: list[str], **extra) -> None:
+        """`extra` (e.g. buttons) goes with the last message."""
         chunk = title
         for line in lines:
             if len(chunk) + len(line) > 3500:
                 self.send(chat_id, chunk)
                 chunk = ""
             chunk += ("\n" if chunk else "") + line
-        self.send(chat_id, chunk)
+        self.send(chat_id, chunk, **extra)
 
     def cmd_pending(self, admin_id: int, args: list[str]) -> None:
         rows = self.store.by_status("pending")
@@ -408,10 +462,62 @@ class Service:
             self.send(admin_id, "Сейчас в чате никого с пробным доступом нет.")
             return
         lines = [f"• {person(row)} — до {when(row['expires_at'])}" for row in active]
+        extra = {}
         if waiting:
             lines.append("\n<b>Одобрены, но ещё не вошли</b>")
             lines += [f"• {person(row)}" for row in waiting]
-        self.send_long(admin_id, f"<b>В чате: {len(active)}</b>", lines)
+            button = {
+                "text": f"Напомнить не вошедшим ({len(waiting)})",
+                "callback_data": REMIND_ALL,
+            }
+            extra["reply_markup"] = {"inline_keyboard": [[button]]}
+        self.send_long(admin_id, f"<b>В чате: {len(active)}</b>", lines, **extra)
+
+    def cmd_remind(self, admin_id: int, args: list[str]) -> None:
+        """Send the join link again to everyone who was approved but has not joined."""
+        if self.chat_id is None:
+            self.send(admin_id, "Чат ещё не привязан: отправьте /bind в самом чате.")
+            return
+        rows = self.store.by_status("approved")
+        if not rows:
+            self.send(admin_id, "Одобренных, но не вошедших в чат, сейчас нет.")
+            return
+        now = self.now()
+        last = int(self.store.get_setting("reminded_all_at") or 0)
+        wait = last + REMIND_COOLDOWN_SEC - now
+        if wait > 0:
+            self.send(
+                admin_id,
+                f"Напоминание уже рассылали {when(last)}. "
+                f"Повторить можно через {-(-wait // 60)} мин.",
+            )
+            return
+        self.store.set_setting("reminded_all_at", str(now))
+
+        sent, queued, undelivered = 0, 0, []
+        for row in rows:
+            # A link that has run out is made anew; when Telegram limits link creation the
+            # row is left to `tick`, which sends the link as soon as it can make one.
+            result = self.send_link(row, retrying=True, remind=True)
+            if result == "sent":
+                sent += 1
+            elif result == "queued":
+                queued += 1
+            else:
+                undelivered.append(row)
+
+        lines = []
+        if queued:
+            lines.append(
+                f"Ещё {queued} получат ссылку чуть позже: Telegram ограничил частоту "
+                "создания ссылок, дошлю сам."
+            )
+        if undelivered:
+            lines.append(
+                f"\n<b>Не смог написать: {len(undelivered)}</b> — пусть отправят мне /start"
+            )
+            lines += [f"• {person(row)}" for row in undelivered]
+        self.send_long(admin_id, f"Напоминание отправлено: {sent} из {len(rows)}.", lines)
 
     def cmd_extend(self, admin_id: int, args: list[str]) -> None:
         usage = "/extend <code>id</code> <code>дней</code>"
@@ -465,8 +571,16 @@ class Service:
                 expire_date=expires, member_limit=1,
             )  # fmt: skip
         except TgError as exc:
-            log.error("createChatInviteLink failed: %s", exc)
-            self.send(admin_id, f"Не получилось создать ссылку: {escape(exc.description)}")
+            log.warning("createChatInviteLink failed: %s", exc)
+            if exc.retry_after:
+                self.links_after = self.now() + exc.retry_after + 1
+                self.send(
+                    admin_id,
+                    "Telegram ограничил частоту создания ссылок. "
+                    f"Повторите /link через {exc.retry_after} с.",
+                )
+            else:
+                self.send(admin_id, f"Не получилось создать ссылку: {escape(exc.description)}")
             return
         self.send(
             admin_id,

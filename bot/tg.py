@@ -4,11 +4,12 @@ import httpx
 
 
 class TgError(Exception):
-    def __init__(self, method: str, code: int, description: str):
+    def __init__(self, method: str, code: int, description: str, retry_after: int | None = None):
         super().__init__(f"{method}: {code} {description}")
         self.method = method
         self.code = code
         self.description = description
+        self.retry_after = retry_after  # seconds, set when Telegram rate-limits the call
 
 
 class Api:
@@ -27,7 +28,12 @@ class Api:
             # str(exc) may contain the URL with the token: report the type only.
             raise TgError(method, 0, type(exc).__name__) from None
         if not body.get("ok"):
-            raise TgError(method, body.get("error_code", 0), body.get("description", ""))
+            raise TgError(
+                method,
+                body.get("error_code", 0),
+                body.get("description", ""),
+                (body.get("parameters") or {}).get("retry_after"),
+            )
         return body.get("result")
 
     def close(self) -> None:

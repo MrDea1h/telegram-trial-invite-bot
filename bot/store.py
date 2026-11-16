@@ -108,6 +108,13 @@ class Store:
             statuses,
         ).fetchall()
 
+    def awaiting_link(self) -> list[sqlite3.Row]:
+        """Approved people whose join link could not be created yet."""
+        return self.db.execute(
+            "SELECT * FROM trials WHERE status = 'approved' AND invite_link IS NULL "
+            "ORDER BY decided_at"
+        ).fetchall()
+
     def due(self, now: int) -> list[sqlite3.Row]:
         return self.db.execute(
             "SELECT * FROM trials WHERE status = 'active' AND expires_at <= ? ORDER BY expires_at",
