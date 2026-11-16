@@ -538,8 +538,10 @@ def test_remind_reissues_expired_links_and_queues_them_under_a_rate_limit(env):
     clock.t += 22
     service.tick()
     for user in (EVA, BOB):
-        assert service.store.get(user["id"])["invite_link"]
-        assert "Ссылка в чат" in api.sent(user["id"])[-1]
+        row = service.store.get(user["id"])
+        assert row["invite_link"] and row["remind"] == 0
+        # Sent late, but still worded as the reminder it is.
+        assert api.sent(user["id"])[-1].startswith("Напоминаем")
 
 
 def test_remind_reports_people_it_could_not_write_to(env):
@@ -581,3 +583,26 @@ def test_names_are_escaped(env):
     service, api, _ = env
     service.handle(private("/start", {"id": 9, "first_name": "<b>x</b>&"}))
     assert "&lt;b&gt;x&lt;/b&gt;&amp;" in api.sent(ADMIN)[-1]
+
+
+def test_old_database_gets_the_remind_column(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "bot.db")
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE trials (tg_user_id INTEGER PRIMARY KEY, username TEXT, "
+        "display_name TEXT NOT NULL, status TEXT NOT NULL, requested_at INTEGER NOT NULL, "
+        "decided_at INTEGER, decided_by INTEGER, invite_link TEXT, link_expires_at INTEGER, "
+        "joined_at INTEGER, expires_at INTEGER, reminded_at INTEGER, removed_at INTEGER, "
+        "fail_notified INTEGER NOT NULL DEFAULT 0)"
+    )
+    old.execute(
+        "INSERT INTO trials (tg_user_id, display_name, status, requested_at) "
+        "VALUES (5, 'Eva', 'approved', 1)"
+    )
+    old.commit()
+    old.close()
+    store = Store(path)
+    assert store.get(5)["remind"] == 0 and store.get(5)["status"] == "approved"
+    Store(path)  # opening again does not try to add the column twice

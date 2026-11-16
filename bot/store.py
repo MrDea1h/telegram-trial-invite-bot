@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS trials (
     expires_at      INTEGER,
     reminded_at     INTEGER,
     removed_at      INTEGER,
-    fail_notified   INTEGER NOT NULL DEFAULT 0
+    fail_notified   INTEGER NOT NULL DEFAULT 0,
+    remind          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_trials_status_expires ON trials (status, expires_at);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -47,6 +48,10 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        # Databases created before the reminder existed lack its column.
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(trials)")}
+        if "remind" not in columns:
+            self.db.execute("ALTER TABLE trials ADD COLUMN remind INTEGER NOT NULL DEFAULT 0")
 
     # --- settings -----------------------------------------------------------------------
 
@@ -84,7 +89,7 @@ class Store:
             "display_name = excluded.display_name, status = 'pending', "
             "requested_at = excluded.requested_at, decided_at = NULL, decided_by = NULL, "
             "invite_link = NULL, link_expires_at = NULL, joined_at = NULL, expires_at = NULL, "
-            "reminded_at = NULL, removed_at = NULL, fail_notified = 0 "
+            "reminded_at = NULL, removed_at = NULL, fail_notified = 0, remind = 0 "
             "WHERE trials.status = 'reset'",
             (user_id, username, name, now),
         )

@@ -238,8 +238,12 @@ class Service:
                     self.links_after = now + (exc.retry_after or LINK_RETRY_SEC) + 1
                     log.warning("createChatInviteLink failed: %s", exc)
             if link is None:
-                # Forget the stale link so that `tick` picks the row up.
-                self.store.move(user_id, "approved", invite_link=None, link_expires_at=None)
+                # Forget the stale link so that `tick` picks the row up; a reminder stays
+                # a reminder when the link is finally made.
+                self.store.move(
+                    user_id, "approved", invite_link=None, link_expires_at=None,
+                    remind=1 if remind else row["remind"],
+                )  # fmt: skip
                 if not retrying:
                     self.send(
                         user_id,
@@ -247,7 +251,9 @@ class Service:
                         "нескольких минут, ничего нажимать не нужно.",
                     )
                 return "queued"
-            self.store.move(user_id, "approved", invite_link=link, link_expires_at=expires)
+            self.store.move(
+                user_id, "approved", invite_link=link, link_expires_at=expires, remind=0
+            )
         intro = (
             "Напоминаем: заявка одобрена, а вы ещё не вошли в чат. "
             f"Ссылка (только для вас, действует до {when(expires)}):\n"
@@ -383,7 +389,7 @@ class Service:
         for row in self.store.awaiting_link():
             if now < self.links_after:
                 break
-            if self.send_link(row, retrying=True) == "undelivered":
+            if self.send_link(row, retrying=True, remind=bool(row["remind"])) == "undelivered":
                 self.tell_admins(f"{UNDELIVERED}\n{person(row)}")
         for row in self.store.to_remind(now, self.cfg.remind_sec):
             if self.store.move(row["tg_user_id"], "active", reminded_at=now):
