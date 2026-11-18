@@ -18,10 +18,20 @@ class Api:
         self._http = httpx.Client(timeout=timeout)
 
     def call(self, method: str, _timeout: float | None = None, **params):
-        payload = {key: value for key, value in params.items() if value is not None}
+        return self._post(method, _timeout, json=self._clean(params))
+
+    def upload(self, method: str, files: dict, **params):
+        """A call that carries a file: `files` maps a field to (name, bytes, content type)."""
+        return self._post(method, 60.0, data=self._clean(params), files=files)
+
+    @staticmethod
+    def _clean(params: dict) -> dict:
+        return {key: value for key, value in params.items() if value is not None}
+
+    def _post(self, method: str, timeout: float | None, **body_args):
         try:
             response = self._http.post(
-                self._base + method, json=payload, timeout=_timeout or self._http.timeout
+                self._base + method, timeout=timeout or self._http.timeout, **body_args
             )
             body = response.json()
         except (httpx.HTTPError, ValueError) as exc:

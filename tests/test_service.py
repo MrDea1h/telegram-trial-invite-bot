@@ -32,6 +32,9 @@ class FakeApi:
             return self.bot_member
         return True
 
+    def upload(self, method, files, **params):
+        return self.call(method, files=files, **params)
+
     def sent(self, chat_id) -> list[str]:
         return [p["text"] for m, p in self.calls if m == "sendMessage" and p["chat_id"] == chat_id]
 

@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS trials (
 );
 CREATE INDEX IF NOT EXISTS ix_trials_status_expires ON trials (status, expires_at);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS spins (
+    tg_user_id INTEGER PRIMARY KEY,
+    prize      TEXT NOT NULL,
+    days       INTEGER NOT NULL DEFAULT 0,
+    applied    INTEGER NOT NULL DEFAULT 0,
+    spun_at    INTEGER NOT NULL
+);
 """
 
 # pending  - asked, waiting for an admin
@@ -65,6 +72,29 @@ class Store:
             "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+    # --- prize wheel --------------------------------------------------------------------
+
+    def get_spin(self, user_id: int) -> sqlite3.Row | None:
+        return self.db.execute("SELECT * FROM spins WHERE tg_user_id = ?", (user_id,)).fetchone()
+
+    def add_spin(self, user_id: int, prize: str, days: int, now: int) -> bool:
+        """False if the person has a spin already: the primary key makes it one per person."""
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO spins (tg_user_id, prize, days, spun_at) VALUES (?, ?, ?, ?)",
+            (user_id, prize, days, now),
+        )
+        return cursor.rowcount == 1
+
+    def mark_spin_applied(self, user_id: int) -> None:
+        self.db.execute("UPDATE spins SET applied = 1 WHERE tg_user_id = ?", (user_id,))
+
+    def spins(self) -> list[sqlite3.Row]:
+        """Every spin with the person's name, oldest first."""
+        return self.db.execute(
+            "SELECT s.*, t.username, t.display_name FROM spins s "
+            "JOIN trials t ON t.tg_user_id = s.tg_user_id ORDER BY s.spun_at"
+        ).fetchall()
 
     # --- trials -------------------------------------------------------------------------
 

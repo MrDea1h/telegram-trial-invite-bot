@@ -27,8 +27,28 @@ Sent to the bot in a private chat, by users listed in `ADMIN_IDS`.
 | `/revoke <id>` | remove from the chat early, or cancel an approval |
 | `/reset <id>` | allow a new request (lifts the ban in the chat) |
 | `/link` | a single-use invite link (one join, valid 24 hours) with no request and no time limit |
+| `/prizes` | the prize wheel: prizes with their chances and stock, and who won what |
+| `/setprizes` | set the prizes of the wheel (see below); `/setprizes off` turns the wheel off |
 
 `@username` works in place of `<id>`.
+
+## Prize wheel
+
+A person who has joined the chat through the bot's link can send the bot `/HESOYAM` once. The bot draws a prize, stores it, and answers with a GIF of a wheel that stops on that prize; after the stop the winning sector stays lit and the rest goes dim; the prize is also written under a spoiler in the caption. The draw happens on the server before the picture is made, so the picture decides nothing. Admins get a message with the winner and the prize. An admin's own `/HESOYAM` is a trial run: nothing is stored.
+
+Prizes are set by an admin, one per line:
+
+```
+/setprizes
+30 | Sticker pack
+10 | A week in the chat | +7
+1 | School merch | x3
+```
+
+The first number is the weight: the larger it is, the more often the prize comes up. `+7` makes the bot extend the winner's access by 7 days itself (if the person has already left the chat, the admins are asked to decide). `x3` limits the prize to three winners. Every other prize is handed over by an admin. With no prizes set the wheel is off.
+Two more optional fields: `=Short text` is what the wheel itself shows when the title is long, and `-` marks an empty sector — the person gets nothing and admins are not pinged.
+
+Branding is optional: put a square picture named `wheel-logo.png` next to the database (on the data volume) to show it in the wheel's hub, and set `WHEEL_BRAND` to a short word for the plaque under the wheel. The bundled font is Geologica (SIL Open Font License, see `bot/assets/Geologica-OFL.txt`).
 
 ## Setting up the chat
 
@@ -50,6 +70,8 @@ Copy `.env.example` to `.env`.
 | `LINK_TTL_HOURS` | `24` | how long an invite link works |
 | `REMIND_HOURS` | `24` | how long before the end the person is reminded |
 | `DB_PATH` | `./data/bot.db` | SQLite file (`/data/bot.db` in the container) |
+| `WHEEL_BRAND` | — | a short word on the plaque under the prize wheel |
+| `WHEEL_LOGO` | `wheel-logo.png` next to the database | picture for the wheel's hub |
 
 ## Running
 
@@ -74,8 +96,9 @@ One process: long polling (no domain, webhook or inbound port needed) and the ti
 ```
 bot/
 ├─ main.py      # loop: getUpdates → handle → tick
-├─ service.py   # all behaviour: requests, decisions, joining, reminders, removal, commands
-├─ store.py     # SQLite: `trials` (one row per person) and `settings`
+├─ service.py   # all behaviour: requests, decisions, joining, reminders, removal, wheel, commands
+├─ wheel.py     # the prize wheel picture (GIF, made with Pillow)
+├─ store.py     # SQLite: `trials` (one row per person), `spins` and `settings`
 ├─ tg.py        # minimal Bot API client
 └─ config.py    # settings from the environment
 ```

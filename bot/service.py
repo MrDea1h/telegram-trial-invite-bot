@@ -4,11 +4,15 @@
 Both are safe to repeat: every state change is guarded by the row's current status.
 """
 
+import json
 import logging
+import random
+import re
 import time
 from datetime import UTC, datetime, timedelta, timezone
 from html import escape
 
+from bot import wheel
 from bot.config import DAY, Config
 from bot.store import USED_UP, Store
 from bot.tg import TgError
@@ -37,10 +41,69 @@ ADMIN_HELP = (
     "/extend <code>id</code> <code>дней</code> — продлить доступ\n"
     "/revoke <code>id</code> — убрать из чата досрочно или отменить одобрение\n"
     "/reset <code>id</code> — разрешить человеку подать заявку заново\n"
-    "/link — разовая ссылка в чат без заявки и без срока\n\n"
+    "/link — разовая ссылка в чат без заявки и без срока\n"
+    "/prizes — призы колеса и кто что выиграл\n"
+    "/setprizes — задать призы колеса (без параметров покажу формат)\n\n"
     "Вместо id можно писать @username.\n"
     "Чат привязывается командой /bind, отправленной в самом чате."
 )
+
+
+SPIN = "/hesoyam"  # what a person sends to spin the wheel; Telegram commands ignore case
+MAX_PRIZES = 24
+MAX_LABEL = 30  # the short text on the wheel itself
+PRIZES_HELP = (
+    "Каждая строка — один приз:\n"
+    "<code>/setprizes\n"
+    "30 | Стикерпак\n"
+    "10 | Неделя в чате | +7\n"
+    "1 | Мерч школы | x3</code>\n\n"
+    "Первое число — вес: чем он больше, тем чаще приз выпадает.\n"
+    "<code>+7</code> — я сам продлю победителю доступ в чат на 7 дней.\n"
+    "<code>x3</code> — таких призов всего три, потом он перестанет выпадать.\n"
+    "<code>=Коротко</code> — подпись на самом колесе, если название длинное.\n"
+    "<code>-</code> — пустой сектор: человеку ничего не полагается.\n"
+    "Остальные призы вручает администратор: я напишу, кто что выиграл.\n\n"
+    "/setprizes off — выключить колесо."
+)
+
+
+def parse_prizes(text: str) -> tuple[list[dict], str | None]:
+    """Prizes from the lines of /setprizes, or the reason the text cannot be read."""
+    prizes = []
+    for number, line in enumerate((part.strip() for part in text.splitlines()), 1):
+        if not line:
+            continue
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) < 2 or not fields[0].isdigit() or not 1 <= int(fields[0]) <= 100000:
+            return [], f"Строка {number}: в начале нужен вес — целое число от 1, затем «|»."
+        if not 1 <= len(fields[1]) <= 60:
+            return [], f"Строка {number}: название приза — от 1 до 60 символов."
+        prize = {"title": fields[1], "weight": int(fields[0]), "days": 0, "left": None}
+        for extra in fields[2:]:
+            if match := re.fullmatch(r"\+\s*(\d{1,3})", extra):
+                prize["days"] = int(match[1])
+            elif match := re.fullmatch(r"[xXхХ×]\s*(\d{1,6})", extra):
+                prize["left"] = int(match[1])
+            elif extra.startswith("=") and 1 <= len(extra[1:].strip()) <= MAX_LABEL:
+                prize["label"] = extra[1:].strip()
+            elif extra in ("-", "—", "–"):
+                prize["empty"] = True
+            elif extra:
+                return [], (
+                    f"Строка {number}: не понял «{escape(extra)}». Можно +дней, xКоличество, "
+                    f"=подпись на колесе (до {MAX_LABEL} символов) или «-» для пустого сектора."
+                )
+        if prize["days"] > 365 or prize["left"] == 0:
+            return [], f"Строка {number}: дней — не больше 365, количество — от 1."
+        if prize["days"] and prize.get("empty"):
+            return [], f"Строка {number}: пустой сектор не может продлевать доступ."
+        prizes.append(prize)
+    if not prizes:
+        return [], "Не нашёл ни одного приза."
+    if len(prizes) > MAX_PRIZES:
+        return [], f"Слишком много призов: на колесо помещается не больше {MAX_PRIZES}."
+    return prizes, None
 
 
 def when(ts: int) -> str:
@@ -62,11 +125,12 @@ def person(row) -> str:
 
 
 class Service:
-    def __init__(self, api, store: Store, cfg: Config, clock=time.time):
+    def __init__(self, api, store: Store, cfg: Config, clock=time.time, rng=None):
         self.api = api
         self.store = store
         self.cfg = cfg
         self._clock = clock
+        self.rng = rng or random.SystemRandom()  # draws the prize
         self.links_after = 0  # no link creation before this moment (rate limit)
 
     def now(self) -> int:
@@ -112,7 +176,7 @@ class Service:
         text = (message.get("text") or "").strip()
         if sender.get("is_bot") or "id" not in sender or not text.startswith("/"):
             return
-        command, _, rest = text.partition(" ")
+        command, rest = (text.split(maxsplit=1) + [""])[:2]  # a newline ends a command too
         command = command.split("@", 1)[0].lower()
         args = rest.split()
         chat = message["chat"]
@@ -125,6 +189,14 @@ class Service:
         if not is_admin:
             if command == "/start":
                 self.on_start(sender)
+            elif command == SPIN:
+                self.on_spin(sender)
+            return
+        if command == SPIN:
+            self.demo_spin(sender["id"])
+            return
+        if command == "/setprizes":
+            self.cmd_setprizes(sender["id"], rest)
             return
 
         handlers = {
@@ -135,6 +207,7 @@ class Service:
             "/revoke": self.cmd_revoke,
             "/reset": self.cmd_reset,
             "/link": self.cmd_link,
+            "/prizes": self.cmd_prizes,
         }
         if command in handlers:
             handlers[command](sender["id"], args)
@@ -267,6 +340,163 @@ class Service:
             f"Доступ продлится {days_word(self.cfg.trial_sec // DAY)} с момента входа.",
         )
         return "sent" if delivered else "undelivered"
+
+    # --- prize wheel --------------------------------------------------------------------
+
+    def prizes(self) -> list[dict]:
+        return json.loads(self.store.get_setting("prizes") or "[]")
+
+    def draw(self, prizes: list[dict]) -> int | None:
+        """Index of a prize picked by weight among those still in stock."""
+        available = [index for index, prize in enumerate(prizes) if prize["left"] != 0]
+        if not available:
+            return None
+        return self.rng.choices(available, weights=[prizes[i]["weight"] for i in available])[0]
+
+    def show_wheel(
+        self, chat_id: int, prizes: list[dict], index: int, intro: str, result: str
+    ) -> bool:
+        """The spinning wheel with the result under a spoiler, or plain text if the picture
+        cannot be made or sent. False when the person could not be written to at all."""
+        try:
+            data = wheel.render(
+                [prize.get("label") or prize["title"] for prize in prizes],
+                index, self.rng.uniform(-0.35, 0.35),
+                logo=self.cfg.wheel_logo, brand=self.cfg.wheel_brand,
+            )  # fmt: skip
+            self.api.upload(
+                "sendAnimation", {"animation": ("wheel.gif", data, "image/gif")},
+                chat_id=chat_id, parse_mode="HTML",
+                caption=f"{intro}\n<tg-spoiler>{result}</tg-spoiler>",
+            )  # fmt: skip
+            return True
+        except TgError as exc:
+            log.warning("sendAnimation to %s failed: %s", chat_id, exc)
+        except Exception:  # the prize is drawn already: a broken picture must not lose it
+            log.exception("wheel picture failed")
+        return self.send(chat_id, f"{intro}\n{result}")
+
+    def on_spin(self, sender: dict) -> None:
+        user_id = sender["id"]
+        row = self.store.get(user_id)
+        if row is None or not row["joined_at"]:
+            self.send(user_id, "Этот код срабатывает только у тех, кто вошёл в чат по моей ссылке.")
+            return
+        if spin := self.store.get_spin(user_id):
+            if spin["days"] < 0:
+                self.send(user_id, "Чит-код уже использован: в тот раз колесо выпало без приза.")
+                return
+            self.send(
+                user_id, f"Чит-код уже использован. Ваш приз: <b>{escape(spin['prize'])}</b>."
+            )
+            return
+        prizes = self.prizes()
+        if not prizes:
+            self.send(user_id, "Колесо пока не запущено.")
+            return
+        index = self.draw(prizes)
+        if index is None:
+            self.send(user_id, "Призы закончились.")
+            return
+        prize = prizes[index]
+        empty = bool(prize.get("empty"))  # stored as days = -1: nothing to hand over
+        days = -1 if empty else prize["days"]
+        if not self.store.add_spin(user_id, prize["title"], days, self.now()):
+            return
+        if prize["left"] is not None:
+            prize["left"] -= 1
+            self.store.set_setting("prizes", json.dumps(prizes, ensure_ascii=False))
+
+        title = escape(prize["title"])
+        outcome = "Администратор напишет вам, чтобы вручить приз."
+        admin_note = "Приз нужно вручить."
+        if prize["days"] and row["status"] == "active":
+            expires = row["expires_at"] + prize["days"] * DAY
+            if self.store.move(
+                user_id, "active", expires_at=expires, reminded_at=None, fail_notified=0
+            ):
+                self.store.mark_spin_applied(user_id)
+                outcome = f"Доступ в чат продлён до {when(expires)}."
+                admin_note = f"Доступ продлил сам — теперь до {when(expires)}."
+        elif prize["days"]:
+            admin_note = (
+                f"Приз — {days_word(prize['days'])} в чате, но человек уже не в чате: "
+                "продлить сам не могу, решите вручную."
+            )
+        result = f"Ваш приз: <b>{title}</b>\n{outcome}"
+        if empty:
+            result = "В этот раз без приза — так выпало колесо."
+        delivered = self.show_wheel(
+            user_id, prizes, index, "Чит-код принят. Колесо крутится…", result
+        )  # fmt: skip
+        if empty:
+            return  # admins have nothing to do; the spin is in /prizes
+        if not delivered:
+            admin_note += "\nНе смог написать человеку о выигрыше."
+        self.tell_admins(f"Колесо: {person(row)}\nПриз: <b>{title}</b>\n{admin_note}")
+
+    def demo_spin(self, admin_id: int) -> None:
+        """An admin's own spin: shows the wheel, records nothing, takes no prize from stock."""
+        prizes = self.prizes()
+        index = self.draw(prizes)
+        if index is None:
+            self.send(admin_id, "Призов нет: задайте их командой /setprizes.")
+            return
+        self.show_wheel(
+            admin_id, prizes, index, "Пробный прокрут: в розыгрыш не записан.",
+            f"Выпало: <b>{escape(prizes[index]['title'])}</b>",
+        )  # fmt: skip
+
+    def cmd_prizes(self, admin_id: int, args: list[str]) -> None:
+        prizes = self.prizes()
+        if not prizes:
+            self.send(admin_id, "Колесо выключено: призов нет.\n\n" + PRIZES_HELP)
+            return
+        in_stock = sum(prize["weight"] for prize in prizes if prize["left"] != 0)
+        lines = []
+        for number, prize in enumerate(prizes, 1):
+            if prize["left"] == 0:
+                note = "закончился"
+            else:
+                note = f"шанс {prize['weight'] * 100 / in_stock:.1f}%"
+                if prize["left"] is not None:
+                    note += f", осталось {prize['left']}"
+            if prize["days"]:
+                note += f", продлеваю сам на {days_word(prize['days'])}"
+            if prize.get("empty"):
+                note += ", пустой сектор"
+            if prize.get("label"):
+                note += f", на колесе «{escape(prize['label'])}»"
+            lines.append(f"{number}. {escape(prize['title'])} — {note}")
+        spins = self.store.spins()
+        lines.append(f"\n<b>Крутили: {len(spins)}</b>")
+        for spin in spins:
+            done = "выдан" if spin["applied"] else "вручить"
+            if spin["days"] < 0:
+                done = "без приза"
+            lines.append(f"• {person(spin)} — {escape(spin['prize'])} ({done})")
+        self.send_long(
+            admin_id, "<b>Призы колеса</b> — ученик крутит командой /HESOYAM, один раз", lines
+        )
+
+    def cmd_setprizes(self, admin_id: int, text: str) -> None:
+        if not text.strip():
+            self.send(admin_id, PRIZES_HELP)
+            return
+        if text.strip().lower() == "off":
+            self.store.set_setting("prizes", "[]")
+            self.send(admin_id, "Колесо выключено. Уже выигранные призы остались в /prizes.")
+            return
+        prizes, error = parse_prizes(text)
+        if error:
+            self.send(admin_id, f"{error}\n\n{PRIZES_HELP}")
+            return
+        self.store.set_setting("prizes", json.dumps(prizes, ensure_ascii=False))
+        self.send(
+            admin_id,
+            f"Призов на колесе: {len(prizes)}. Проверьте список: /prizes, "
+            "пробный прокрут — /HESOYAM.",
+        )
 
     # --- an admin decides ---------------------------------------------------------------
 
