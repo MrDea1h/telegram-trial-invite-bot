@@ -888,3 +888,33 @@ def test_expired_followup_after_one_hour():
     clock.t += HOUR
     service.tick()
     assert api.sent(EVA["id"]) == [] and api.sent(BOB["id"]) == []
+
+
+def test_scheduled_batch_followup_for_historical_expired():
+    api, clock = FakeApi(), Clock()
+    cfg = Config(token=f"{BOT_ID}:secret", admin_ids=frozenset({ADMIN}), db_path=":memory:")
+    service = Service(api, Store(":memory:"), cfg, clock)
+    service.handle(group_msg("/bind", ADMIN))
+    service.handle(private("/setprizes\n100 | Скидка 1000 р", ADMIN))
+    admit(service, EVA)
+    admit(service, BOB)
+    service.handle(private("/HESOYAM", BOB))
+    clock.t += 7 * DAY
+    service.tick()
+    # Simulate historical rows marked followup_sent_at = 0.
+    service.store.set_followup_sent(EVA["id"], 0)
+    service.store.set_followup_sent(BOB["id"], 0)
+    target_ts = int(clock.t) + 2 * HOUR
+    service.store.set_setting("batch_followup_at", str(target_ts))
+
+    api.calls.clear()
+    clock.t += HOUR
+    service.tick()
+    assert api.sent(EVA["id"]) == [] and api.sent(BOB["id"]) == []
+
+    clock.t += HOUR
+    service.tick()
+    assert "/HESOYAM" in api.sent(EVA["id"])[-1]
+    assert "напомнить про твою персональную скидку" in api.sent(BOB["id"])[-1]
+    assert "Отложенная рассылка по колесу завершена: отправлено 2." in api.sent(ADMIN)[-1]
+    assert service.store.get_setting("batch_followup_at") == "0"

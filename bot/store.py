@@ -233,6 +233,13 @@ class Store:
             (cutoff,),
         ).fetchall()
 
+    def due_scheduled_followup(self) -> list[sqlite3.Row]:
+        """Historical expired rows marked 0 waiting for a one-off scheduled follow-up."""
+        return self.db.execute(
+            "SELECT * FROM trials WHERE status = 'expired' AND followup_sent_at = 0 "
+            "ORDER BY coalesce(removed_at, requested_at)"
+        ).fetchall()
+
     def set_followup_sent(self, user_id: int, value: int) -> None:
         self.db.execute(
             "UPDATE trials SET followup_sent_at = ? WHERE tg_user_id = ?", (value, user_id)

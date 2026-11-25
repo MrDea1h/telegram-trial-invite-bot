@@ -747,34 +747,45 @@ class Service:
             self.remove(row, "expired", now)
         for row in self.store.due_followup(now, self.cfg.followup_delay_sec):
             self.send_expired_followup(row, now)
+        batch_at = int(self.store.get_setting("batch_followup_at") or 0)
+        if batch_at and now >= batch_at:
+            self.store.set_setting("batch_followup_at", "0")
+            sent = 0
+            for row in self.store.due_scheduled_followup():
+                if self.send_expired_followup(row, now):
+                    sent += 1
+            log.info("scheduled followup finished: sent=%d", sent)
+            self.tell_admins(f"Отложенная рассылка по колесу завершена: отправлено {sent}.")
         if self.extra_chat_id is not None and self.cfg.extra_chat_tag:
             for row in self.store.due_extra_tag(now, self.cfg.trial_sec):
                 self.tag_extra_member(row, now)
 
-    def send_expired_followup(self, row, now: int) -> None:
+    def send_expired_followup(self, row, now: int) -> bool:
         """Send a post-expiration wheel offer (or prize reminder) after followup_delay_sec."""
         user_id = row["tg_user_id"]
         spin = self.store.get_spin(user_id)
         won_prize = spin is not None and spin["days"] >= 0
         if won_prize:
-            self.send(
+            delivered = self.send(
                 user_id,
                 "Хочу напомнить про твою персональную скидку, которую ты получил "
                 "на колесе фортуны. Она будет действовать ещё 24 часа — не упусти "
                 "возможность ей воспользоваться!",
             )
             self.store.set_followup_sent(user_id, now)
-        elif self.prizes():
-            self.send(
+            return delivered
+        if self.prizes():
+            delivered = self.send(
                 user_id,
                 "Чтобы помочь тебе принять решение, предлагаем персональную скидку "
                 "при оплате в ближайшие 24 часа.\n\n"
                 "Какую скидку? Чтобы узнать, крути колесо фортуны — отправь /HESOYAM",
             )
             self.store.set_followup_sent(user_id, now)
-        else:
-            # Wheel is disabled and the user has no won prize: skip without sending.
-            self.store.set_followup_sent(user_id, 0)
+            return delivered
+        # Wheel is disabled and the user has no won prize: skip without sending.
+        self.store.set_followup_sent(user_id, 0)
+        return False
 
     def tag_extra_member(self, row, now: int) -> bool:
         """Set the post-trial member tag in the 2nd chat without removing the person."""
