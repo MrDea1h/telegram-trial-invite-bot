@@ -608,4 +608,132 @@ def test_old_database_gets_the_remind_column(tmp_path):
     old.close()
     store = Store(path)
     assert store.get(5)["remind"] == 0 and store.get(5)["status"] == "approved"
+    assert store.get(5)["extra_joined_at"] is None and store.get(5)["extra_tagged_at"] is None
     Store(path)  # opening again does not try to add the column twice
+
+
+EXTRA_CHAT = -1002
+
+
+def extra_msg(text, sender_id=ADMIN, chat_type="supergroup"):
+    return {
+        "message": {
+            "chat": {"id": EXTRA_CHAT, "type": chat_type, "title": "Чат 2"},
+            "from": {"id": sender_id, "first_name": "Админ"},
+            "text": text,
+        }
+    }
+
+
+def member_event(chat_id, user, status):
+    return {
+        "chat_member": {
+            "chat": {"id": chat_id},
+            "new_chat_member": {"user": user, "status": status},
+        }
+    }
+
+
+def test_extra_chat_one_time_link_and_week_tag():
+    api, clock = FakeApi(), Clock()
+    api.bot_member["can_manage_tags"] = True
+    cfg = Config(
+        token=f"{BOT_ID}:secret",
+        admin_ids=frozenset({ADMIN}),
+        db_path=":memory:",
+        extra_chat_tag="прошла неделя",
+    )
+    service = Service(api, Store(":memory:"), cfg, clock)
+    service.handle(group_msg("/bind", ADMIN))
+    # /bind2 refuses binding the same chat as the main chat.
+    service.handle(group_msg("/bind2", ADMIN))
+    assert "уже привязан как основной" in api.sent(CHAT)[-1]
+
+    service.handle(extra_msg("/bind2", ADMIN))
+    assert service.extra_chat_id == EXTRA_CHAT
+    assert "Второй чат привязан" in api.sent(EXTRA_CHAT)[-1]
+    api.calls.clear()
+
+    # Approval creates two personal join-request links (one per chat) and sends both.
+    service.handle(private("/start", EVA))
+    service.handle(press("ok", EVA["id"]))
+    msg = api.sent(EVA["id"])[-1]
+    assert "https://t.me/+link1" in msg
+    assert "https://t.me/+link2" in msg
+    assert "Основной чат" in msg and "Второй чат" in msg
+
+    # Stranger trying Eva's 2nd-chat link is declined.
+    service.handle(join_request(BOB, chat=EXTRA_CHAT))
+    assert api.last("declineChatJoinRequest") == {"chat_id": EXTRA_CHAT, "user_id": BOB["id"]}
+
+    # Eva joins both chats via her personal join-request links; 2nd link is revoked on join.
+    service.handle(join_request(EVA))
+    service.handle(join_request(EVA, chat=EXTRA_CHAT))
+    assert api.last("revokeChatInviteLink") == {
+        "chat_id": EXTRA_CHAT,
+        "invite_link": "https://t.me/+link2",
+    }
+    clock.t += 6 * DAY
+    service.tick()
+    assert "setChatMemberTag" not in api.methods()
+
+    # After 7 days: main chat bans Eva, 2nd chat sets the tag without banning.
+    clock.t += 1 * DAY
+    service.tick()
+    tag_call = api.last("setChatMemberTag")
+    assert tag_call == {
+        "chat_id": EXTRA_CHAT,
+        "user_id": EVA["id"],
+        "tag": "прошла неделя",
+    }
+    bans = [p["chat_id"] for m, p in api.calls if m == "banChatMember"]
+    assert bans == [CHAT]
+
+    # Subsequent ticks do not re-tag.
+    api.calls.clear()
+    service.tick()
+    assert "setChatMemberTag" not in api.methods()
+
+
+def test_extra_chat_bind2_checks_tag_rights():
+    api, clock = FakeApi(), Clock()
+    cfg = Config(token=f"{BOT_ID}:secret", admin_ids=frozenset({ADMIN}), db_path=":memory:")
+    service = Service(api, Store(":memory:"), cfg, clock)
+    service.handle(extra_msg("/bind2", ADMIN))
+    assert service.extra_chat_id is None
+    assert "Управление тегами" in api.sent(EXTRA_CHAT)[-1]
+
+
+def test_extra_chat_tag_skipped_if_not_participant_and_warns_once_on_rights():
+    api, clock = FakeApi(), Clock()
+    cfg = Config(
+        token=f"{BOT_ID}:secret",
+        admin_ids=frozenset({ADMIN}),
+        db_path=":memory:",
+        extra_chat_id=EXTRA_CHAT,
+        extra_chat_tag="прошла неделя",
+    )
+    service = Service(api, Store(":memory:"), cfg, clock)
+    service.handle(group_msg("/bind", ADMIN))
+    admit(service, EVA)
+    admit(service, BOB)
+    clock.t += 7 * DAY
+
+    # Not a participant -> marked skipped (0), no admin warning, no infinite retries.
+    api.fail["setChatMemberTag"] = TgError(
+        "setChatMemberTag", 400, "Bad Request: USER_NOT_PARTICIPANT"
+    )
+    service.tick()
+    assert service.store.get(EVA["id"])["extra_tagged_at"] == 0
+    assert service.store.get(BOB["id"])["extra_tagged_at"] == 0
+    api.calls.clear()
+    service.tick()
+    assert "setChatMemberTag" not in api.methods()
+
+    # If Eva joins the 2nd chat later, her join resets extra_tagged_at and tags after 7 days.
+    del api.fail["setChatMemberTag"]
+    service.handle(member_event(EXTRA_CHAT, EVA, "member"))
+    assert service.store.get(EVA["id"])["extra_tagged_at"] is None
+    clock.t += 7 * DAY
+    service.tick()
+    assert api.last("setChatMemberTag")["user_id"] == EVA["id"]

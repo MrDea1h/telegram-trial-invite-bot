@@ -45,7 +45,8 @@ ADMIN_HELP = (
     "/prizes — призы колеса и кто что выиграл\n"
     "/setprizes — задать призы колеса (без параметров покажу формат)\n\n"
     "Вместо id можно писать @username.\n"
-    "Чат привязывается командой /bind, отправленной в самом чате."
+    "Чат привязывается командой /bind, отправленной в самом чате.\n"
+    "Второй чат (бессрочный, с тегом спустя неделю) — командой /bind2 в нём."
 )
 
 
@@ -132,6 +133,7 @@ class Service:
         self._clock = clock
         self.rng = rng or random.SystemRandom()  # draws the prize
         self.links_after = 0  # no link creation before this moment (rate limit)
+        self.extra_tag_warned = False  # warn admins at most once about missing tag rights
 
     def now(self) -> int:
         return int(self._clock())
@@ -140,6 +142,11 @@ class Service:
     def chat_id(self) -> int | None:
         value = self.store.get_setting("chat_id")
         return int(value) if value else None
+
+    @property
+    def extra_chat_id(self) -> int | None:
+        value = self.store.get_setting("extra_chat_id")
+        return int(value) if value else self.cfg.extra_chat_id
 
     # --- sending ------------------------------------------------------------------------
 
@@ -183,8 +190,11 @@ class Service:
         is_admin = sender["id"] in self.cfg.admin_ids
 
         if chat["type"] != "private":
-            if command == "/bind" and is_admin:
-                self.bind(chat)
+            if is_admin:
+                if command == "/bind":
+                    self.bind(chat)
+                elif command == "/bind2":
+                    self.bind_extra(chat)
             return
         if not is_admin:
             if command == "/start":
@@ -241,6 +251,43 @@ class Service:
         self.store.set_setting("chat_title", chat.get("title") or "")
         self.send(chat_id, "Чат привязан. Заявки принимаю в личных сообщениях.")
 
+    def bind_extra(self, chat: dict) -> None:
+        chat_id = chat["id"]
+        if chat_id == self.chat_id:
+            self.send(chat_id, "Этот чат уже привязан как основной.")
+            return
+        try:
+            me = self.api.call("getChatMember", chat_id=chat_id, user_id=self.cfg.bot_id)
+        except TgError as exc:
+            self.send(chat_id, f"Не получилось проверить мои права: {escape(exc.description)}")
+            return
+        missing = []
+        if me.get("status") != "administrator":
+            missing.append("сделать меня администратором")
+        else:
+            if not me.get("can_invite_users"):
+                missing.append("разрешить «Пригласительные ссылки»")
+            if not me.get("can_manage_tags"):
+                missing.append("разрешить «Управление тегами»")
+        if chat["type"] != "supergroup":
+            missing.append("превратить группу в супергруппу (например, включить историю чата "
+                           "для новых участников)")  # fmt: skip
+        if missing:
+            self.send(
+                chat_id, "Привязать второй чат пока нельзя. Нужно: " + "; ".join(missing) + "."
+            )
+            return
+        self.store.set_setting("extra_chat_id", str(chat_id))
+        self.store.set_setting("extra_chat_title", chat.get("title") or "")
+        self.extra_tag_warned = False
+        tag_note = (
+            f" Спустя {days_word(self.cfg.trial_sec // DAY)} буду ставить участникам тег "
+            f"«{escape(self.cfg.extra_chat_tag)}»."
+            if self.cfg.extra_chat_tag
+            else ""
+        )
+        self.send(chat_id, f"Второй чат привязан. Из него никого не удаляю.{tag_note}")
+
     # --- a person asks for access -------------------------------------------------------
 
     def on_start(self, sender: dict) -> None:
@@ -285,8 +332,22 @@ class Service:
                 },
             )
 
+    def _make_join_link(self, chat_id: int, name: str, expires: int, now: int) -> str | None:
+        if now < self.links_after:
+            return None
+        try:
+            created = self.api.call(
+                "createChatInviteLink", chat_id=chat_id, name=name[:32],
+                expire_date=expires, creates_join_request=True,
+            )  # fmt: skip
+            return created["invite_link"]
+        except TgError as exc:
+            self.links_after = now + (exc.retry_after or LINK_RETRY_SEC) + 1
+            log.warning("createChatInviteLink for %s failed: %s", chat_id, exc)
+            return None
+
     def send_link(self, row, retrying: bool = False, remind: bool = False) -> str:
-        """Send the join link, making a new one when there is none or it has run out.
+        """Send personal join link(s), making new ones when missing or expired.
 
         Returns "sent", "undelivered" (the person cannot be written to) or "queued": Telegram
         limits how often links are created, so `tick` makes the link later and sends it then.
@@ -294,51 +355,71 @@ class Service:
         """
         user_id = row["tg_user_id"]
         now = self.now()
+        extra_chat_id = self.extra_chat_id
         link = row["invite_link"]
+        extra_link = row["extra_invite_link"]
         expires = row["link_expires_at"] or 0
-        if not link or expires <= now + 60:
+        stale = expires <= now + 60
+        if stale:
             link = None
+            extra_link = None
             expires = now + self.cfg.link_ttl_sec
-            if now >= self.links_after:
-                try:
-                    created = self.api.call(
-                        "createChatInviteLink", chat_id=self.chat_id,
-                        name=f"trial {user_id}"[:32], expire_date=expires,
-                        creates_join_request=True,
-                    )  # fmt: skip
-                    link = created["invite_link"]
-                except TgError as exc:
-                    self.links_after = now + (exc.retry_after or LINK_RETRY_SEC) + 1
-                    log.warning("createChatInviteLink failed: %s", exc)
-            if link is None:
-                # Forget the stale link so that `tick` picks the row up; a reminder stays
-                # a reminder when the link is finally made.
-                self.store.move(
-                    user_id, "approved", invite_link=None, link_expires_at=None,
-                    remind=1 if remind else row["remind"],
-                )  # fmt: skip
-                if not retrying:
-                    self.send(
-                        user_id,
-                        "Заявка одобрена. Ссылку в чат пришлю чуть позже — обычно в течение "
-                        "нескольких минут, ничего нажимать не нужно.",
-                    )
-                return "queued"
+
+        need_main = link is None
+        need_extra = extra_chat_id is not None and extra_link is None
+        if need_main:
+            link = self._make_join_link(self.chat_id, f"trial {user_id}", expires, now)
+        if need_extra and link is not None:
+            extra_link = self._make_join_link(extra_chat_id, f"extra {user_id}", expires, now)
+
+        if link is None or (extra_chat_id is not None and extra_link is None):
+            # Save whatever link was created and leave the row for `tick` to finish.
             self.store.move(
-                user_id, "approved", invite_link=link, link_expires_at=expires, remind=0
+                user_id, "approved", invite_link=link, extra_invite_link=extra_link,
+                link_expires_at=expires if link else None,
+                remind=1 if remind else row["remind"],
+            )  # fmt: skip
+            if not retrying:
+                self.send(
+                    user_id,
+                    "Заявка одобрена. Ссылку в чат пришлю чуть позже — обычно в течение "
+                    "нескольких минут, ничего нажимать не нужно.",
+                )
+            return "queued"
+
+        if need_main or need_extra:
+            self.store.move(
+                user_id, "approved", invite_link=link, extra_invite_link=extra_link,
+                link_expires_at=expires, remind=0,
+            )  # fmt: skip
+
+        days_text = days_word(self.cfg.trial_sec // DAY)
+        if extra_link:
+            intro = (
+                "Напоминаем: заявка одобрена, а вы ещё не вошли в чат. "
+                f"Персональные ссылки (только для вас, действуют до {when(expires)}):"
+                if remind
+                else "Заявка одобрена. Персональные ссылки (только для вас, действуют сутки):"
             )
-        intro = (
-            "Напоминаем: заявка одобрена, а вы ещё не вошли в чат. "
-            f"Ссылка (только для вас, действует до {when(expires)}):\n"
-            if remind
-            else "Заявка одобрена. Ссылка в чат (только для вас, действует сутки):\n"
-        )
-        delivered = self.send(
-            user_id,
-            f"{intro}{link}\n\n"
-            "Нажмите её и подайте запрос на вступление — я подтвержу его сразу. "
-            f"Доступ продлится {days_word(self.cfg.trial_sec // DAY)} с момента входа.",
-        )
+            text = (
+                f"{intro}\n\n"
+                f"Основной чат (доступ на {days_text} с момента входа):\n{link}\n\n"
+                f"Второй чат (доступ бессрочный):\n{extra_link}\n\n"
+                "Нажмите ссылки и подайте запросы на вступление — я подтвержу их сразу."
+            )
+        else:
+            intro = (
+                "Напоминаем: заявка одобрена, а вы ещё не вошли в чат. "
+                f"Ссылка (только для вас, действует до {when(expires)}):\n"
+                if remind
+                else "Заявка одобрена. Ссылка в чат (только для вас, действует сутки):\n"
+            )
+            text = (
+                f"{intro}{link}\n\n"
+                "Нажмите её и подайте запрос на вступление — я подтвержу его сразу. "
+                f"Доступ продлится {days_text} с момента входа."
+            )
+        delivered = self.send(user_id, text)
         return "sent" if delivered else "undelivered"
 
     # --- prize wheel --------------------------------------------------------------------
@@ -569,10 +650,31 @@ class Service:
         link = request.get("invite_link") or {}
         # Only requests that came through this bot's own links are ours to decide; the chat
         # may have other join-request links handled by people.
-        if chat_id != self.chat_id or (link.get("creator") or {}).get("id") != self.cfg.bot_id:
+        if (link.get("creator") or {}).get("id") != self.cfg.bot_id:
             return
         user_id = request["from"]["id"]
         row = self.store.get(user_id)
+        if chat_id == self.extra_chat_id:
+            if (
+                row is None
+                or row["status"] not in ("approved", "active")
+                or row["extra_joined_at"] is not None
+            ):
+                self.safe("declineChatJoinRequest", chat_id=chat_id, user_id=user_id)
+                return
+            try:
+                self.api.call("approveChatJoinRequest", chat_id=chat_id, user_id=user_id)
+            except TgError as exc:
+                log.error("approveChatJoinRequest (extra) for %s failed: %s", user_id, exc)
+                return
+            self.store.set_extra_joined(user_id, self.now())
+            if row["extra_invite_link"]:
+                self.safe(
+                    "revokeChatInviteLink", chat_id=chat_id, invite_link=row["extra_invite_link"]
+                )
+            return
+        if chat_id != self.chat_id:
+            return
         if row is None or row["status"] != "approved":
             # Someone else used a forwarded link, or the approval was revoked.
             self.safe("declineChatJoinRequest", chat_id=chat_id, user_id=user_id)
@@ -590,11 +692,16 @@ class Service:
         self.send(user_id, f"Добро пожаловать! Доступ в чат открыт до {when(expires)}.")
 
     def on_chat_member(self, change: dict) -> None:
-        if change["chat"]["id"] != self.chat_id:
-            return
+        chat_id = change["chat"]["id"]
         member = change.get("new_chat_member") or {}
         user_id = (member.get("user") or {}).get("id")
-        if user_id is None or member.get("status") not in ("left", "kicked"):
+        if user_id is None:
+            return
+        if chat_id == self.extra_chat_id:
+            if member.get("status") == "member":
+                self.store.set_extra_joined(user_id, self.now())
+            return
+        if chat_id != self.chat_id or member.get("status") not in ("left", "kicked"):
             return
         # Our own removals change the status first, so only a real early exit matches here.
         if self.store.move(user_id, "active", status="left", removed_at=self.now()):
@@ -616,7 +723,7 @@ class Service:
         chat_id = self.chat_id
         if chat_id is None:
             return
-        for row in self.store.awaiting_link():
+        for row in self.store.awaiting_link(extra_chat=self.extra_chat_id is not None):
             if now < self.links_after:
                 break
             if self.send_link(row, retrying=True, remind=bool(row["remind"])) == "undelivered":
@@ -629,6 +736,41 @@ class Service:
                 )
         for row in self.store.due(now):
             self.remove(row, "expired", now)
+        if self.extra_chat_id is not None and self.cfg.extra_chat_tag:
+            for row in self.store.due_extra_tag(now, self.cfg.trial_sec):
+                self.tag_extra_member(row, now)
+
+    def tag_extra_member(self, row, now: int) -> bool:
+        """Set the post-trial member tag in the 2nd chat without removing the person."""
+        user_id = row["tg_user_id"]
+        try:
+            self.api.call(
+                "setChatMemberTag", chat_id=self.extra_chat_id,
+                user_id=user_id, tag=self.cfg.extra_chat_tag,
+            )  # fmt: skip
+        except TgError as exc:
+            desc = exc.description.lower()
+            if any(
+                s in desc
+                for s in ("user_not_participant", "user not found", "participant_id_invalid")
+            ):
+                # Not in the 2nd chat: mark skipped (0) so tick does not retry every 20s;
+                # if they join later, on_chat_member resets it.
+                self.store.set_extra_tagged(user_id, 0)
+            else:
+                log.warning("setChatMemberTag for %s failed: %s", user_id, exc)
+                if not self.extra_tag_warned and any(
+                    s in desc for s in ("right", "admin", "can_manage_tags", "forbidden")
+                ):
+                    self.extra_tag_warned = True
+                    self.tell_admins(
+                        "Не могу поставить тег во втором чате: "
+                        f"{escape(exc.description)}\n"
+                        "Проверьте, что у бота есть право «Управление тегами»."
+                    )
+            return False
+        self.store.set_extra_tagged(user_id, now)
+        return True
 
     def remove(self, row, new_status: str, now: int) -> bool:
         """Ban the person in the chat (the ban stays: the trial is one-time)."""
@@ -790,6 +932,12 @@ class Service:
             if row["invite_link"]:
                 self.safe(
                     "revokeChatInviteLink", chat_id=self.chat_id, invite_link=row["invite_link"]
+                )
+            if row["extra_invite_link"] and self.extra_chat_id is not None:
+                self.safe(
+                    "revokeChatInviteLink",
+                    chat_id=self.extra_chat_id,
+                    invite_link=row["extra_invite_link"],
                 )
             self.send(admin_id, f"Отменил: {person(row)} — в чат он не попадёт.")
         else:

@@ -23,7 +23,10 @@ CREATE TABLE IF NOT EXISTS trials (
     reminded_at     INTEGER,
     removed_at      INTEGER,
     fail_notified   INTEGER NOT NULL DEFAULT 0,
-    remind          INTEGER NOT NULL DEFAULT 0
+    remind          INTEGER NOT NULL DEFAULT 0,
+    extra_invite_link TEXT,
+    extra_joined_at INTEGER,
+    extra_tagged_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_trials_status_expires ON trials (status, expires_at);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -55,10 +58,16 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
-        # Databases created before the reminder existed lack its column.
+        # Databases created before newer columns existed need light migrations.
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(trials)")}
         if "remind" not in columns:
             self.db.execute("ALTER TABLE trials ADD COLUMN remind INTEGER NOT NULL DEFAULT 0")
+        if "extra_invite_link" not in columns:
+            self.db.execute("ALTER TABLE trials ADD COLUMN extra_invite_link TEXT")
+        if "extra_joined_at" not in columns:
+            self.db.execute("ALTER TABLE trials ADD COLUMN extra_joined_at INTEGER")
+        if "extra_tagged_at" not in columns:
+            self.db.execute("ALTER TABLE trials ADD COLUMN extra_tagged_at INTEGER")
 
     # --- settings -----------------------------------------------------------------------
 
@@ -119,7 +128,8 @@ class Store:
             "display_name = excluded.display_name, status = 'pending', "
             "requested_at = excluded.requested_at, decided_at = NULL, decided_by = NULL, "
             "invite_link = NULL, link_expires_at = NULL, joined_at = NULL, expires_at = NULL, "
-            "reminded_at = NULL, removed_at = NULL, fail_notified = 0, remind = 0 "
+            "reminded_at = NULL, removed_at = NULL, fail_notified = 0, remind = 0, "
+            "extra_invite_link = NULL, extra_joined_at = NULL, extra_tagged_at = NULL "
             "WHERE trials.status = 'reset'",
             (user_id, username, name, now),
         )
@@ -143,8 +153,14 @@ class Store:
             statuses,
         ).fetchall()
 
-    def awaiting_link(self) -> list[sqlite3.Row]:
-        """Approved people whose join link could not be created yet."""
+    def awaiting_link(self, extra_chat: bool = False) -> list[sqlite3.Row]:
+        """Approved people whose join link(s) could not be created yet."""
+        if extra_chat:
+            return self.db.execute(
+                "SELECT * FROM trials WHERE status = 'approved' "
+                "AND (invite_link IS NULL OR extra_invite_link IS NULL) "
+                "ORDER BY decided_at"
+            ).fetchall()
         return self.db.execute(
             "SELECT * FROM trials WHERE status = 'approved' AND invite_link IS NULL "
             "ORDER BY decided_at"
@@ -161,4 +177,32 @@ class Store:
             "SELECT * FROM trials WHERE status = 'active' AND reminded_at IS NULL "
             "AND expires_at > ? AND expires_at <= ? ORDER BY expires_at",
             (now, now + ahead),
+        ).fetchall()
+
+    def set_extra_joined(self, user_id: int, now: int) -> bool:
+        """Record when an approved person joined the 2nd chat (only once per join)."""
+        cursor = self.db.execute(
+            "UPDATE trials SET extra_joined_at = ?, extra_tagged_at = NULL "
+            "WHERE tg_user_id = ? AND status IN ('approved', 'active', 'expired', 'left') "
+            "AND (extra_joined_at IS NULL OR extra_tagged_at = 0)",
+            (now, user_id),
+        )
+        return cursor.rowcount == 1
+
+    def set_extra_tagged(self, user_id: int, value: int) -> None:
+        """Mark the 2nd-chat tag done (unix timestamp) or skipped (0 = not in chat)."""
+        self.db.execute(
+            "UPDATE trials SET extra_tagged_at = ? WHERE tg_user_id = ?", (value, user_id)
+        )
+
+    def due_extra_tag(self, now: int, after_sec: int) -> list[sqlite3.Row]:
+        """Approved people whose 2nd-chat member tag is due."""
+        cutoff = now - after_sec
+        return self.db.execute(
+            "SELECT * FROM trials WHERE extra_tagged_at IS NULL "
+            "AND status IN ('approved', 'active', 'expired', 'left') "
+            "AND ((extra_joined_at IS NOT NULL AND extra_joined_at <= ?) "
+            "OR (extra_joined_at IS NULL AND joined_at IS NOT NULL AND joined_at <= ?)) "
+            "ORDER BY coalesce(extra_joined_at, joined_at)",
+            (cutoff, cutoff),
         ).fetchall()

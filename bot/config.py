@@ -16,6 +16,8 @@ class Config:
     db_path: str = "./data/bot.db"
     wheel_logo: str = ""  # picture for the hub of the prize wheel; none if the file is absent
     wheel_brand: str = ""  # a short word on the plaque under the wheel
+    extra_chat_id: int | None = None  # optional 2nd chat (no kick; tagged after trial_sec)
+    extra_chat_tag: str = ""  # optional member tag (max 16 chars, no emojis) set after trial_sec
 
     @property
     def bot_id(self) -> int:
@@ -33,6 +35,7 @@ def from_env() -> Config:
     if not admins:
         raise SystemExit("ADMIN_IDS is not set")
     db_path = os.environ.get("DB_PATH", "./data/bot.db")
+    raw_extra_id = os.environ.get("EXTRA_CHAT_ID", "").strip()
     return Config(
         token=token,
         admin_ids=admins,
@@ -43,4 +46,6 @@ def from_env() -> Config:
         # By default the logo lies next to the database, i.e. on the data volume.
         wheel_logo=os.environ.get("WHEEL_LOGO") or str(Path(db_path).parent / "wheel-logo.png"),
         wheel_brand=os.environ.get("WHEEL_BRAND", "").strip(),
+        extra_chat_id=int(raw_extra_id) if raw_extra_id else None,
+        extra_chat_tag=os.environ.get("EXTRA_CHAT_TAG", "").strip()[:16],
     )
