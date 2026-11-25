@@ -153,6 +153,9 @@ class Store:
             statuses,
         ).fetchall()
 
+    def all_trials(self) -> list[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM trials ORDER BY requested_at DESC").fetchall()
+
     def awaiting_link(self, extra_chat: bool = False) -> list[sqlite3.Row]:
         """Approved people whose join link(s) could not be created yet."""
         if extra_chat:

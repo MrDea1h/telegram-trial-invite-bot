@@ -26,6 +26,7 @@ LINK_RETRY_SEC = 30  # pause after a failed link creation when Telegram names no
 UNDELIVERED = "Не смог написать человеку: пусть отправит мне /start, пришлю ссылку."
 REMIND_COOLDOWN_SEC = 600  # two admins pressing in a row must not write to everyone twice
 REMIND_ALL = "remind_all"  # callback data of the button under /list
+EXPORT_TXT = "export_txt"  # callback data of the export-to-txt button under /list
 LINK_NOTES = {
     "sent": "",
     "undelivered": "\n" + UNDELIVERED,
@@ -36,6 +37,7 @@ ADMIN_HELP = (
     "<b>Команды</b>\n"
     "/pending — заявки, которые ждут решения\n"
     "/list — кто сейчас в чате и до какого числа\n"
+    "/export — скачать список участников (активных и всех) в .txt\n"
     "/remind — ещё раз прислать ссылку всем, кого одобрили, но кто так и не вошёл "
     "(та же кнопка есть под /list)\n"
     "/extend <code>id</code> <code>дней</code> — продлить доступ\n"
@@ -212,6 +214,7 @@ class Service:
         handlers = {
             "/pending": self.cmd_pending,
             "/list": self.cmd_list,
+            "/export": self.cmd_export,
             "/remind": self.cmd_remind,
             "/extend": self.cmd_extend,
             "/revoke": self.cmd_revoke,
@@ -584,6 +587,10 @@ class Service:
     def on_callback(self, query: dict) -> None:
         admin_id = query["from"]["id"]
         action, _, raw_id = (query.get("data") or "").partition(":")
+        if action == EXPORT_TXT and admin_id in self.cfg.admin_ids:
+            self.answer(query, "Готовлю файл")
+            self.cmd_export(admin_id, [])
+            return
         if action == REMIND_ALL and admin_id in self.cfg.admin_ids:
             self.answer(query, "Рассылаю")
             # The count on the button is stale after this press: take the button away.
@@ -836,20 +843,97 @@ class Service:
     def cmd_list(self, admin_id: int, args: list[str]) -> None:
         active = self.store.by_status("active")
         waiting = self.store.by_status("approved")
+        export_btn = {"text": "Скачать список (.txt)", "callback_data": EXPORT_TXT}
         if not active and not waiting:
-            self.send(admin_id, "Сейчас в чате никого с пробным доступом нет.")
+            self.send(
+                admin_id,
+                "Сейчас в чате никого с пробным доступом нет.",
+                reply_markup={"inline_keyboard": [[export_btn]]},
+            )
             return
         lines = [f"• {person(row)} — до {when(row['expires_at'])}" for row in active]
-        extra = {}
+        keyboard = []
         if waiting:
             lines.append("\n<b>Одобрены, но ещё не вошли</b>")
             lines += [f"• {person(row)}" for row in waiting]
-            button = {
-                "text": f"Напомнить не вошедшим ({len(waiting)})",
-                "callback_data": REMIND_ALL,
-            }
-            extra["reply_markup"] = {"inline_keyboard": [[button]]}
-        self.send_long(admin_id, f"<b>В чате: {len(active)}</b>", lines, **extra)
+            keyboard.append(
+                [
+                    {
+                        "text": f"Напомнить не вошедшим ({len(waiting)})",
+                        "callback_data": REMIND_ALL,
+                    }
+                ]
+            )
+        keyboard.append([export_btn])
+        self.send_long(
+            admin_id,
+            f"<b>В чате: {len(active)}</b>",
+            lines,
+            reply_markup={"inline_keyboard": keyboard},
+        )
+
+    def cmd_export(self, admin_id: int, args: list[str]) -> None:
+        """Send a UTF-8 .txt report of active chat members and everyone who interacted."""
+        rows = self.store.all_trials()
+        now = self.now()
+        stamp = datetime.fromtimestamp(now, UTC).astimezone(MSK)
+        active = [r for r in rows if r["status"] == "active"]
+        in_extra = [r for r in rows if r["extra_joined_at"] is not None]
+        approved = [r for r in rows if r["status"] == "approved"]
+        pending = [r for r in rows if r["status"] == "pending"]
+        other = [r for r in rows if r["status"] not in ("active", "approved", "pending")]
+
+        def fmt_row(row, detail: str = "") -> str:
+            uname = f"@{row['username']}" if row["username"] else "-"
+            tail = f" | {detail}" if detail else ""
+            return f"{row['tg_user_id']} | {uname} | {row['display_name']} | {row['status']}{tail}"
+
+        lines = [
+            f"Выгрузка участников бота ({stamp.strftime('%d.%m.%Y %H:%M МСК')})",
+            f"Всего взаимодействовало: {len(rows)}",
+            f"Активных в основном чате: {len(active)}",
+            f"Во втором чате: {len(in_extra)}",
+            f"Одобрены, не вошли: {len(approved)}",
+            f"Ожидают решения: {len(pending)}",
+            "",
+            f"=== Активные в основном чате ({len(active)}) ===",
+        ]
+        for r in active:
+            lines.append(fmt_row(r, f"вошёл {when(r['joined_at'])}, до {when(r['expires_at'])}"))
+        lines += ["", f"=== Во втором чате ({len(in_extra)}) ==="]
+        for r in in_extra:
+            tag_state = (
+                f"тег поставлен {when(r['extra_tagged_at'])}"
+                if r["extra_tagged_at"] and r["extra_tagged_at"] > 0
+                else "без тега"
+            )
+            lines.append(fmt_row(r, f"вошёл {when(r['extra_joined_at'])}, {tag_state}"))
+        lines += ["", f"=== Одобрены, но ещё не вошли ({len(approved)}) ==="]
+        for r in approved:
+            lines.append(fmt_row(r, f"одобрен {when(r['decided_at'])}" if r["decided_at"] else ""))
+        lines += ["", f"=== Ожидают решения ({len(pending)}) ==="]
+        for r in pending:
+            lines.append(fmt_row(r, f"заявка {when(r['requested_at'])}"))
+        lines += ["", f"=== Остальные, взаимодействовавшие с ботом ({len(other)}) ==="]
+        for r in other:
+            ts = r["removed_at"] or r["decided_at"] or r["requested_at"]
+            lines.append(fmt_row(r, when(ts)))
+
+        payload = ("\n".join(lines) + "\n").encode("utf-8")
+        filename = f"participants-{stamp.strftime('%Y%m%d-%H%M')}.txt"
+        caption = (
+            f"Участники: активных {len(active)}, во 2-м чате {len(in_extra)}, всего {len(rows)}."
+        )
+        try:
+            self.api.upload(
+                "sendDocument",
+                {"document": (filename, payload, "text/plain; charset=utf-8")},
+                chat_id=admin_id,
+                caption=caption,
+            )
+        except TgError as exc:
+            log.warning("sendDocument to %s failed: %s", admin_id, exc)
+            self.send(admin_id, f"Не получилось отправить файл: {escape(exc.description)}")
 
     def cmd_remind(self, admin_id: int, args: list[str]) -> None:
         """Send the join link again to everyone who was approved but has not joined."""

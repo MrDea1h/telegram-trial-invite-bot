@@ -737,3 +737,69 @@ def test_extra_chat_tag_skipped_if_not_participant_and_warns_once_on_rights():
     clock.t += 7 * DAY
     service.tick()
     assert api.last("setChatMemberTag")["user_id"] == EVA["id"]
+
+
+def test_export_txt_command_and_button():
+    api, clock = FakeApi(), Clock()
+    api.bot_member["can_manage_tags"] = True
+    cfg = Config(
+        token=f"{BOT_ID}:secret",
+        admin_ids=frozenset({ADMIN}),
+        db_path=":memory:",
+        extra_chat_id=EXTRA_CHAT,
+        extra_chat_tag="прошла неделя",
+    )
+    service = Service(api, Store(":memory:"), cfg, clock)
+    service.handle(group_msg("/bind", ADMIN))
+    # Eva is active in both chats, Bob is rejected.
+    service.handle(private("/start", EVA))
+    service.handle(press("ok", EVA["id"]))
+    service.handle(join_request(EVA))
+    service.handle(join_request(EVA, chat=EXTRA_CHAT))
+    service.handle(private("/start", BOB))
+    service.handle(press("no", BOB["id"]))
+    api.calls.clear()
+
+    # /list includes the export button.
+    service.handle(private("/list", ADMIN))
+    kb = api.last("sendMessage")["reply_markup"]["inline_keyboard"]
+    assert any(btn["callback_data"] == "export_txt" for row in kb for btn in row)
+
+    # /export uploads a UTF-8 .txt document containing both Eva and Bob.
+    service.handle(private("/export", ADMIN))
+    doc = api.last("sendDocument")
+    assert doc["chat_id"] == ADMIN
+    filename, payload, mime = doc["files"]["document"]
+    assert filename.endswith(".txt") and "text/plain" in mime
+    text = payload.decode("utf-8")
+    assert "Активные в основном чате (1)" in text
+    assert "Во втором чате (1)" in text
+    assert "Остальные, взаимодействовавшие с ботом (1)" in text
+    assert "@eva" in text and "Боб" in text
+
+    # Clicking the inline button triggers export for admin and is blocked for non-admin.
+    api.calls.clear()
+    service.handle(
+        {
+            "callback_query": {
+                "id": "q_exp",
+                "from": {"id": ADMIN},
+                "data": "export_txt",
+                "message": {"message_id": 10, "chat": {"id": ADMIN}},
+            }
+        }
+    )
+    assert "sendDocument" in api.methods()
+
+    api.calls.clear()
+    service.handle(
+        {
+            "callback_query": {
+                "id": "q_exp2",
+                "from": {"id": BOB["id"]},
+                "data": "export_txt",
+                "message": {"message_id": 10, "chat": {"id": BOB["id"]}},
+            }
+        }
+    )
+    assert "sendDocument" not in api.methods()
