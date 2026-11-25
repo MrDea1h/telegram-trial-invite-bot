@@ -128,11 +128,12 @@ def person(row) -> str:
 
 
 class Service:
-    def __init__(self, api, store: Store, cfg: Config, clock=time.time, rng=None):
+    def __init__(self, api, store: Store, cfg: Config, clock=time.time, rng=None, sleep=time.sleep):
         self.api = api
         self.store = store
         self.cfg = cfg
         self._clock = clock
+        self._sleep = sleep
         self.rng = rng or random.SystemRandom()  # draws the prize
         self.links_after = 0  # no link creation before this moment (rate limit)
         self.extra_tag_warned = False  # warn admins at most once about missing tag rights
@@ -154,15 +155,23 @@ class Service:
 
     def send(self, chat_id: int, text: str, **extra) -> bool:
         """False when the message could not be delivered (e.g. the person blocked the bot)."""
-        try:
-            self.api.call(
-                "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-                disable_web_page_preview=True, **extra,
-            )  # fmt: skip
-            return True
-        except TgError as exc:
-            log.warning("sendMessage to %s failed: %s", chat_id, exc)
-            return False
+        for attempt in range(2):
+            try:
+                self.api.call(
+                    "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+                    disable_web_page_preview=True, **extra,
+                )  # fmt: skip
+                return True
+            except TgError as exc:
+                if exc.retry_after and attempt == 0:
+                    log.warning(
+                        "sendMessage to %s rate-limited, sleeping %ss", chat_id, exc.retry_after + 1
+                    )
+                    self._sleep(exc.retry_after + 1)
+                    continue
+                log.warning("sendMessage to %s failed: %s", chat_id, exc)
+                return False
+        return False
 
     def tell_admins(self, text: str, **extra) -> None:
         for admin_id in sorted(self.cfg.admin_ids):
@@ -750,12 +759,17 @@ class Service:
         batch_at = int(self.store.get_setting("batch_followup_at") or 0)
         if batch_at and now >= batch_at:
             self.store.set_setting("batch_followup_at", "0")
+            batch_rows = self.store.due_scheduled_followup()
             sent = 0
-            for row in self.store.due_scheduled_followup():
+            for idx, row in enumerate(batch_rows):
+                if idx > 0:
+                    self._sleep(0.06)  # stay well under Telegram's 30 msg/s broadcast limit
                 if self.send_expired_followup(row, now):
                     sent += 1
-            log.info("scheduled followup finished: sent=%d", sent)
-            self.tell_admins(f"Отложенная рассылка по колесу завершена: отправлено {sent}.")
+            log.info("scheduled followup finished: sent=%d/%d", sent, len(batch_rows))
+            self.tell_admins(
+                f"Отложенная рассылка по колесу завершена: доставлено {sent} из {len(batch_rows)}."
+            )
         if self.extra_chat_id is not None and self.cfg.extra_chat_tag:
             for row in self.store.due_extra_tag(now, self.cfg.trial_sec):
                 self.tag_extra_member(row, now)

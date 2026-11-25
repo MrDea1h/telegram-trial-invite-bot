@@ -916,5 +916,5 @@ def test_scheduled_batch_followup_for_historical_expired():
     service.tick()
     assert "/HESOYAM" in api.sent(EVA["id"])[-1]
     assert "напомнить про твою персональную скидку" in api.sent(BOB["id"])[-1]
-    assert "Отложенная рассылка по колесу завершена: отправлено 2." in api.sent(ADMIN)[-1]
+    assert "Отложенная рассылка по колесу завершена: доставлено 2 из 2." in api.sent(ADMIN)[-1]
     assert service.store.get_setting("batch_followup_at") == "0"
