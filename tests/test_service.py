@@ -803,3 +803,19 @@ def test_export_txt_command_and_button():
         }
     )
     assert "sendDocument" not in api.methods()
+
+
+def test_custom_expired_text():
+    api, clock = FakeApi(), Clock()
+    cfg = Config(
+        token=f"{BOT_ID}:secret",
+        admin_ids=frozenset({ADMIN}),
+        db_path=":memory:",
+        expired_text="Line 1\n\nLine 2",
+    )
+    service = Service(api, Store(":memory:"), cfg, clock)
+    service.handle(group_msg("/bind", ADMIN))
+    admit(service, EVA)
+    clock.t += 7 * DAY
+    service.tick()
+    assert api.sent(EVA["id"])[-1] == "Line 1\n\nLine 2"

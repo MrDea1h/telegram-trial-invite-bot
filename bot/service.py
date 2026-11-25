@@ -796,7 +796,11 @@ class Service:
             return False
         self.store.move(user_id, "active", status=new_status, removed_at=now)
         if new_status == "expired":
-            self.send(user_id, "Пробный доступ в чат закончился. Спасибо, что были с нами!")
+            self.send(
+                user_id,
+                self.cfg.expired_text
+                or "Пробный доступ в чат закончился. Спасибо, что были с нами!",
+            )
             self.tell_admins(f"Срок вышел, убран из чата: {person(row)}")
         return True
 
