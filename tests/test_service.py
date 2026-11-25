@@ -819,3 +819,72 @@ def test_custom_expired_text():
     clock.t += 7 * DAY
     service.tick()
     assert api.sent(EVA["id"])[-1] == "Line 1\n\nLine 2"
+
+
+def test_empty_spin_allows_retry_until_win():
+    class FixedRng:
+        def __init__(self, seq):
+            self.seq = iter(seq)
+
+        def choices(self, population, weights):
+            return [next(self.seq)]
+
+        def uniform(self, a, b):
+            return 0.0
+
+    api, clock = FakeApi(), Clock()
+    cfg = Config(token=f"{BOT_ID}:secret", admin_ids=frozenset({ADMIN}), db_path=":memory:")
+    service = Service(api, Store(":memory:"), cfg, clock, rng=FixedRng([0, 1]))
+    service.handle(group_msg("/bind", ADMIN))
+    service.handle(private("/setprizes\n50 | Без приза | -\n50 | Скидка 1000 р", ADMIN))
+    admit(service, EVA)
+    api.calls.clear()
+
+    # First spin lands on empty: no spin locked, user invited to retry, admins not bothered.
+    service.handle(private("/HESOYAM", EVA))
+    assert service.store.get_spin(EVA["id"]) is None
+    assert "ещё попытка" in api.last("sendAnimation")["caption"]
+    assert api.sent(ADMIN) == []
+
+    # Second spin lands on real prize: locked in DB and admins notified.
+    service.handle(private("/HESOYAM", EVA))
+    assert service.store.get_spin(EVA["id"])["prize"] == "Скидка 1000 р"
+    assert any("Скидка 1000 р" in m for m in api.sent(ADMIN))
+
+    # Third spin is blocked because a real prize was already won.
+    api.calls.clear()
+    service.handle(private("/HESOYAM", EVA))
+    assert "уже использован" in api.sent(EVA["id"])[-1]
+
+
+def test_expired_followup_after_one_hour():
+    api, clock = FakeApi(), Clock()
+    cfg = Config(token=f"{BOT_ID}:secret", admin_ids=frozenset({ADMIN}), db_path=":memory:")
+    service = Service(api, Store(":memory:"), cfg, clock)
+    service.handle(group_msg("/bind", ADMIN))
+    service.handle(private("/setprizes\n100 | Скидка 1000 р", ADMIN))
+    admit(service, EVA)
+    admit(service, BOB)
+    # Bob wins a prize before expiring; Eva does not spin yet.
+    service.handle(private("/HESOYAM", BOB))
+    clock.t += 7 * DAY
+    service.tick()  # both expire
+
+    # Before 1 hour: no follow-up sent yet.
+    api.calls.clear()
+    clock.t += 59 * 60
+    service.tick()
+    assert api.sent(EVA["id"]) == [] and api.sent(BOB["id"]) == []
+
+    # At 1 hour: Eva gets wheel offer, Bob gets reminder about his won discount.
+    clock.t += 60
+    service.tick()
+    assert "/HESOYAM" in api.sent(EVA["id"])[-1]
+    assert "персональную скидку" in api.sent(EVA["id"])[-1]
+    assert "напомнить про твою персональную скидку" in api.sent(BOB["id"])[-1]
+
+    # Subsequent ticks do not re-send follow-up.
+    api.calls.clear()
+    clock.t += HOUR
+    service.tick()
+    assert api.sent(EVA["id"]) == [] and api.sent(BOB["id"]) == []

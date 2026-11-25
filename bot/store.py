@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS trials (
     remind          INTEGER NOT NULL DEFAULT 0,
     extra_invite_link TEXT,
     extra_joined_at INTEGER,
-    extra_tagged_at INTEGER
+    extra_tagged_at INTEGER,
+    followup_sent_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_trials_status_expires ON trials (status, expires_at);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -68,6 +69,12 @@ class Store:
             self.db.execute("ALTER TABLE trials ADD COLUMN extra_joined_at INTEGER")
         if "extra_tagged_at" not in columns:
             self.db.execute("ALTER TABLE trials ADD COLUMN extra_tagged_at INTEGER")
+        if "followup_sent_at" not in columns:
+            self.db.execute("ALTER TABLE trials ADD COLUMN followup_sent_at INTEGER")
+            # Do not retroactively message historical expired trials on migration.
+            self.db.execute(
+                "UPDATE trials SET followup_sent_at = 0 WHERE status = 'expired'"
+            )
 
     # --- settings -----------------------------------------------------------------------
 
@@ -88,12 +95,18 @@ class Store:
         return self.db.execute("SELECT * FROM spins WHERE tg_user_id = ?", (user_id,)).fetchone()
 
     def add_spin(self, user_id: int, prize: str, days: int, now: int) -> bool:
-        """False if the person has a spin already: the primary key makes it one per person."""
-        cursor = self.db.execute(
-            "INSERT OR IGNORE INTO spins (tg_user_id, prize, days, spun_at) VALUES (?, ?, ?, ?)",
+        """Record a real prize win (replaces any legacy empty-sector row where days < 0)."""
+        existing = self.get_spin(user_id)
+        if existing is not None and existing["days"] >= 0:
+            return False
+        self.db.execute(
+            "INSERT INTO spins (tg_user_id, prize, days, spun_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (tg_user_id) DO UPDATE SET prize = excluded.prize, "
+            "days = excluded.days, applied = 0, spun_at = excluded.spun_at "
+            "WHERE spins.days < 0",
             (user_id, prize, days, now),
         )
-        return cursor.rowcount == 1
+        return True
 
     def mark_spin_applied(self, user_id: int) -> None:
         self.db.execute("UPDATE spins SET applied = 1 WHERE tg_user_id = ?", (user_id,))
@@ -129,7 +142,8 @@ class Store:
             "requested_at = excluded.requested_at, decided_at = NULL, decided_by = NULL, "
             "invite_link = NULL, link_expires_at = NULL, joined_at = NULL, expires_at = NULL, "
             "reminded_at = NULL, removed_at = NULL, fail_notified = 0, remind = 0, "
-            "extra_invite_link = NULL, extra_joined_at = NULL, extra_tagged_at = NULL "
+            "extra_invite_link = NULL, extra_joined_at = NULL, extra_tagged_at = NULL, "
+            "followup_sent_at = NULL "
             "WHERE trials.status = 'reset'",
             (user_id, username, name, now),
         )
@@ -209,3 +223,17 @@ class Store:
             "ORDER BY coalesce(extra_joined_at, joined_at)",
             (cutoff, cutoff),
         ).fetchall()
+
+    def due_followup(self, now: int, delay_sec: int) -> list[sqlite3.Row]:
+        """Expired people who are due for the post-expiration wheel follow-up."""
+        cutoff = now - delay_sec
+        return self.db.execute(
+            "SELECT * FROM trials WHERE status = 'expired' AND followup_sent_at IS NULL "
+            "AND removed_at IS NOT NULL AND removed_at <= ? ORDER BY removed_at",
+            (cutoff,),
+        ).fetchall()
+
+    def set_followup_sent(self, user_id: int, value: int) -> None:
+        self.db.execute(
+            "UPDATE trials SET followup_sent_at = ? WHERE tg_user_id = ?", (value, user_id)
+        )

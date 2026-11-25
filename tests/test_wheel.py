@@ -213,11 +213,12 @@ def test_label_and_empty_sector(wheel_env, monkeypatch):
     assert "без приза" in caption and "Администратор" not in caption
     assert api.sent(ADMIN) == [] and api.sent(ADMIN2) == []  # nothing to hand over
 
+    # Empty sector allows retrying until a real prize is won.
     spin(service, EVA, "Долгое название")
-    assert api.sent(EVA["id"])[-1].endswith("колесо выпало без приза.")
+    assert "Долгое название" in api.last("sendAnimation")["caption"]
     service.handle(private("/prizes", ADMIN))
     text = api.sent(ADMIN)[-1]
-    assert "пустой сектор" in text and "на колесе «Коротко»" in text and "(без приза)" in text
+    assert "пустой сектор" in text and "на колесе «Коротко»" in text and "Долгое название" in text
 
 
 def test_no_prizes_means_no_wheel(wheel_env):

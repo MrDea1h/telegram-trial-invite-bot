@@ -19,6 +19,7 @@ class Config:
     extra_chat_id: int | None = None  # optional 2nd chat (no kick; tagged after trial_sec)
     extra_chat_tag: str = ""  # optional member tag (max 16 chars, no emojis) set after trial_sec
     expired_text: str = ""  # optional custom farewell message sent when trial expires
+    followup_delay_sec: int = 1 * HOUR  # delay after expiration before sending wheel follow-up
 
     @property
     def bot_id(self) -> int:
@@ -50,4 +51,5 @@ def from_env() -> Config:
         extra_chat_id=int(raw_extra_id) if raw_extra_id else None,
         extra_chat_tag=os.environ.get("EXTRA_CHAT_TAG", "").strip()[:16],
         expired_text=os.environ.get("EXPIRED_TEXT", "").replace("\\n", "\n").strip(),
+        followup_delay_sec=int(float(os.environ.get("FOLLOWUP_DELAY_MINUTES", "60")) * 60),
     )
